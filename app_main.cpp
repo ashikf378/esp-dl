@@ -8,6 +8,7 @@
 #include "freertos/task.h"
 
 #include "driver/gpio.h"
+// #include "driver/i2c.h"   // Removed – camera handles I2C
 #include "driver/ledc.h"
 #include "driver/spi_master.h"
 
@@ -53,6 +54,7 @@ static void backlight_pwm_init()
     ledc_channel.channel = LEDC_CHANNEL_0;
     ledc_channel.intr_type = LEDC_INTR_DISABLE;
     ledc_channel.timer_sel = LEDC_TIMER_0;
+    // If active_low, duty=0 means output low -> backlight on (assuming active low)
     ledc_channel.duty = active_low ? 0 : 255;
     ledc_channel.hpoint = 0;
 
@@ -63,6 +65,9 @@ static void backlight_pwm_init()
         gpio_set_level(BSP_LCD_BACKLIGHT, 1);
     } else {
         ESP_LOGI(TAG, "Backlight PWM enabled (duty=%u)", (unsigned int)ledc_channel.duty);
+        // Explicitly set a brightness (optional, but ensures it's on)
+        ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, ledc_channel.duty);
+        ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0);
     }
 }
 
@@ -104,6 +109,11 @@ void lcd_init()
 
     ESP_ERROR_CHECK(esp_lcd_new_panel_st7789(io_handle, &panel_config, &panel_handle));
     ESP_ERROR_CHECK(esp_lcd_panel_init(panel_handle));
+
+    // ----- ADDED: Software reset to ensure clean state -----
+    uint8_t cmd_swreset = 0x01;
+    ESP_ERROR_CHECK(esp_lcd_panel_io_tx_param(io_handle, cmd_swreset, NULL, 0));
+    vTaskDelay(pdMS_TO_TICKS(120)); // Wait for reset to complete
 
     // ST7789 initialization commands
     uint8_t cmd_sleep_out = 0x11;
@@ -209,8 +219,8 @@ const char *classify_distance(int area)
 }
 
 // =================== TEMPORAL SMOOTHING STRUCTURE ===================
-#define SMOOTHING_WINDOW 5     // number of recent detections to keep
-#define MIN_VALID_DETECTIONS 3 // require at least 3 detections before output
+#define SMOOTHING_WINDOW 5
+#define MIN_VALID_DETECTIONS 3
 
 struct SmoothedDetection {
     int cx = -1, cy = -1, area = -1;
@@ -262,7 +272,13 @@ bool get_smoothed_detection(int &cx_out, int &cy_out, int &area_out)
 extern "C" void app_main(void)
 {
     ESP_LOGI(TAG, "Starting...");
+
+    // No manual I2C init – camera driver will handle SCCB using pins 4 & 5
+
     lcd_init();
+
+    // Allow LCD to settle after init
+    vTaskDelay(pdMS_TO_TICKS(500));
 
     // Quick red screen test
     uint16_t *red = (uint16_t *)heap_caps_malloc(LCD_H_RES * LCD_V_RES * sizeof(uint16_t), MALLOC_CAP_DMA);
@@ -309,6 +325,9 @@ extern "C" void app_main(void)
         return;
     }
 
+    // Allow camera to stabilise
+    vTaskDelay(pdMS_TO_TICKS(200));
+
     // Vertical flip
     sensor_t *s = esp_camera_sensor_get();
     if (s) {
@@ -322,9 +341,8 @@ extern "C" void app_main(void)
 
     // Increase confidence threshold for more stable detections
     HandDetect hand_detect(HandDetect::model_type_t::ESPDET_PICO_224_224_HAND);
-    // Override thresholds (defaults are 0.25 score, 0.45 nms)
     hand_detect.set_score_thr(0.5f);
-    hand_detect.set_nms_thr(0.45f); // unchanged but can adjust
+    hand_detect.set_nms_thr(0.45f);
 
     uint16_t *lcd_buffer = (uint16_t *)heap_caps_malloc(LCD_H_RES * LCD_V_RES * sizeof(uint16_t), MALLOC_CAP_DMA);
     if (!lcd_buffer) {
@@ -381,12 +399,9 @@ extern "C" void app_main(void)
 
         if (results.empty()) {
             ESP_LOGI(TAG, "No hand detected");
-            // Clear history on consecutive no-detections? We'll keep old history but not add new.
-            // Optionally clear after a timeout, but here we just don't add new detection.
         } else {
             for (const auto &res : results) {
-                // Use the already increased score threshold in model, but double-check
-                if (res.score < 0.5) // same as set_score_thr, but safe
+                if (res.score < 0.5)
                     continue;
 
                 int x1 = res.box[0], y1 = res.box[1], x2 = res.box[2], y2 = res.box[3];
@@ -409,15 +424,9 @@ extern "C" void app_main(void)
             if (best_cx_img != -1 && best_cy_img != -1) {
                 int area = (best_x2 - best_x1) * (best_y2 - best_y1);
                 add_detection(best_cx_img, best_cy_img, area);
-            } else {
-                // No valid detection (score too low) – optionally clear or ignore
-                // We'll keep history but not add anything. This may cause stale data.
-                // To prevent stale, we could clear if too many frames without detection.
-                // For simplicity, we do nothing and rely on MIN_VALID_DETECTIONS.
             }
         }
 
-        // Get smoothed detection
         int smoothed_cx, smoothed_cy, smoothed_area;
         if (get_smoothed_detection(smoothed_cx, smoothed_cy, smoothed_area)) {
             const char *horiz = classify_horizontal(smoothed_cx);
@@ -432,11 +441,9 @@ extern "C" void app_main(void)
                      smoothed_cy,
                      smoothed_area);
         } else {
-            // Not enough detections – maybe show nothing or last known
             ESP_LOGI(TAG, "Insufficient valid detections for stable output");
         }
 
-        // Draw to LCD
         esp_err_t ret = esp_lcd_panel_draw_bitmap(panel_handle, 0, 0, LCD_H_RES, LCD_V_RES, lcd_buffer);
         if (ret != ESP_OK) {
             ESP_LOGE(TAG, "LCD draw failed: %s", esp_err_to_name(ret));
