@@ -406,42 +406,31 @@ extern "C" void app_main(void)
     vTaskDelay(pdMS_TO_TICKS(200));
 
     // ---- TUNE CAMERA SENSOR FOR BETTER HAND DETECTION ----
-    // ---- TUNE CAMERA SENSOR FOR LOW LIGHT HAND DETECTION ----
     sensor_t *s = esp_camera_sensor_get();
     if (s) {
         // Flip vertically (adjust if needed)
         s->set_vflip(s, 1);
-
-        // ----- Aggressive brightness & contrast for low light -----
-        s->set_brightness(s, 2); // range -2 to 2, max brightness
-        s->set_contrast(s, 2);   // max contrast to separate hand from background
-        s->set_sharpness(s, 2);  // max sharpness for clearer edges
-
-        // ----- Exposure & Gain tuning -----
-        // Enable auto exposure, but increase its target level
-        s->set_exposure_ctrl(s, 1); // auto exposure ON
-        s->set_aec2(s, 1);          // advanced AEC (if supported)
-        s->set_ae_level(s, 2);      // exposure compensation: +2 (makes image brighter)
-
-        // Manual gain control – disable auto gain and set high fixed gain
-        s->set_gain_ctrl(s, 0); // disable auto gain
-        s->set_agc_gain(s, 30); // manual gain (typical max 30, adjust 0-30)
-
-        // Alternative: keep auto gain but set higher ceiling – uncomment next lines
-        // s->set_gain_ctrl(s, 1);        // auto gain ON
-        // s->set_agc_gain(s, 30);        // maximum allowed gain (0-30)
-
-        // White balance (auto)
-        s->set_whitebal(s, 1);
-        s->set_awb_gain(s, 1);
-
-        // Special effect off
+        // Increase contrast to make hand edges pop
+        s->set_contrast(s, 1); // range -2 to 2, default 0
+        // Increase brightness slightly
+        s->set_brightness(s, 1); // range -2 to 2, default 0
+        // Set special effect to "none" (0)
         s->set_special_effect(s, 0);
-
-        ESP_LOGI(TAG, "Low‑light camera tuning: brightness=2, contrast=2, sharpness=2, ae_level=2, manual_gain=30");
+        // Set white balance to auto
+        s->set_whitebal(s, 1);
+        // Set exposure control to auto
+        s->set_exposure_ctrl(s, 1);
+        // Set automatic gain control (AGC)
+        s->set_gain_ctrl(s, 1);
+        // Set automatic white balance gain
+        s->set_awb_gain(s, 1);
+        // Optionally increase sharpness for clearer edges
+        s->set_sharpness(s, 1); // range -2 to 2, default 0
+        ESP_LOGI(TAG, "Camera sensor tuned: contrast=1, brightness=1, sharpness=1");
     } else {
         ESP_LOGW(TAG, "Could not get camera sensor handle");
     }
+
     // 4. BLE init (unchanged)
     nimble_port_init();
     ble_svc_gap_device_name_set("ESP32-Connector");
@@ -450,10 +439,10 @@ extern "C" void app_main(void)
     nimble_port_freertos_init(host_task);
     ESP_LOGI(TAG, "BLE host started");
 
-    // 5. Hand detection model with LOWER SCORE THRESHOLD for low light
+    // 5. Hand detection model with LOWER SCORE THRESHOLD
     HandDetect hand_detect(HandDetect::model_type_t::ESPDET_PICO_224_224_HAND);
-    hand_detect.set_score_thr(0.2f); // lowered from 0.3 to 0.2
-    hand_detect.set_nms_thr(0.45f);
+    hand_detect.set_score_thr(0.3f); // <-- lowered from 0.5 to catch more hands
+    hand_detect.set_nms_thr(0.45f);  // keep same
 
     // 6. LCD buffer (unchanged)
     uint16_t *lcd_buffer = (uint16_t *)heap_caps_malloc(LCD_H_RES * LCD_V_RES * sizeof(uint16_t), MALLOC_CAP_DMA);
@@ -497,27 +486,6 @@ extern "C" void app_main(void)
         }
 
         memcpy(lcd_buffer, fb->buf, expected_size);
-        static bool gamma_init = false;
-        static uint16_t gamma_lut[65536];
-        if (!gamma_init) {
-            for (int i = 0; i < 65536; i++) {
-                float r = ((i >> 11) & 0x1F) / 31.0f;
-                float g = ((i >> 5) & 0x3F) / 63.0f;
-                float b = (i & 0x1F) / 31.0f;
-                float gamma = 0.45f; // typical low‑light gamma
-                r = powf(r, gamma);
-                g = powf(g, gamma);
-                b = powf(b, gamma);
-                uint16_t r5 = (uint16_t)(r * 31);
-                uint16_t g6 = (uint16_t)(g * 63);
-                uint16_t b5 = (uint16_t)(b * 31);
-                gamma_lut[i] = (r5 << 11) | (g6 << 5) | b5;
-            }
-            gamma_init = true;
-        }
-        for (size_t i = 0; i < expected_size / 2; i++) {
-            ((uint16_t *)lcd_buffer)[i] = gamma_lut[((uint16_t *)lcd_buffer)[i]];
-        }
 
         dl::image::img_t hand_img;
         hand_img.width = fb->width;
